@@ -1,0 +1,11 @@
+*.pyc
+
+__pycache__/
+.cache/
+.idea/
+.ipynb_checkpoints/
+.pytest_cache/
+dist/
+*.egg-info/
+
+*~
