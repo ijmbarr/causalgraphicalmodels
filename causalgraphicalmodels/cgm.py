@@ -1,6 +1,7 @@
 import networkx as nx
 import graphviz
 from itertools import combinations, chain
+from collections import Iterable
 
 
 class CausalGraphicalModel:
@@ -8,7 +9,7 @@ class CausalGraphicalModel:
     Causal Graphical Models
     """
 
-    def __init__(self, nodes, edges, set_nodes=None):
+    def __init__(self, nodes, edges, latent_edges=None, set_nodes=None):
         """
         Create CausalGraphicalModel
 
@@ -18,16 +19,38 @@ class CausalGraphicalModel:
 
         edges: list[tuple[node:str, node:str]]
 
-        set_nodes: list[node:str]
+        latent_edges: list[tuple[node:str, node:str]] or None
+
+        set_nodes: list[node:str] or None
         """
         if set_nodes is None:
             self.set_nodes = frozenset()
         else:
             self.set_nodes = frozenset(set_nodes)
 
+        if latent_edges is None:
+            self.latent_edges = frozenset()
+        else:
+            self.latent_edges = frozenset(latent_edges)
+
         self.dag = nx.DiGraph()
         self.dag.add_nodes_from(nodes)
         self.dag.add_edges_from(edges)
+
+        # Add latent connections to the graph
+        self.observed_variables = frozenset(nodes)
+        self.unobserved_variable_edges = dict()
+        unobserved_variables = []
+        unobserved_variable_counter = 0
+        for n1, n2 in self.latent_edges:
+            new_node = "Unobserved_{}".format(unobserved_variable_counter)
+            unobserved_variable_counter += 1
+            self.dag.add_node(new_node)
+            self.dag.add_edge(new_node, n1)
+            self.dag.add_edge(new_node, n2)
+            unobserved_variables.append(new_node)
+            self.unobserved_variable_edges[new_node] = (n1, n2)
+        self.unobserved_variables = frozenset(unobserved_variables)
 
         assert nx.is_directed_acyclic_graph(self.dag)
 
@@ -38,7 +61,7 @@ class CausalGraphicalModel:
         self.graph = self.dag.to_undirected()
 
     def __repr__(self):
-        variables = ", ".join(map(str, sorted(self.dag.nodes())))
+        variables = ", ".join(map(str, sorted(self.observed_variables)))
         return ("{classname}({vars})"
                 .format(classname=self.__class__.__name__,
                         vars=variables))
@@ -49,14 +72,20 @@ class CausalGraphicalModel:
         """
         dot = graphviz.Digraph()
 
-        for node in self.dag.nodes():
+        for node in self.observed_variables:
             if node in self.set_nodes:
                 dot.node(node, node, {"shape": "ellipse", "peripheries": "2"})
             else:
                 dot.node(node, node, {"shape": "ellipse"})
 
         for a, b in self.dag.edges():
-            dot.edge(a, b)
+            if a in self.observed_variables and b in self.observed_variables:
+                dot.edge(a, b)
+
+        for n, (a, b) in self.unobserved_variable_edges.items():
+            dot.node(n, _attributes={"shape": "point"})
+            dot.edge(n, a, _attributes={"style": "dashed"})
+            dot.edge(n, b, _attributes={"style": "dashed"})
 
         return dot
 
@@ -86,20 +115,32 @@ class CausalGraphicalModel:
         """
         Apply intervention on node to CGM
         """
-        assert node in self.dag.nodes()
+        assert node in self.observed_variables
         set_nodes = self.set_nodes | frozenset([node])
-        nodes = self.dag.nodes()
+        nodes = self.observed_variables
         edges = [
             (a, b)
             for a, b in self.dag.edges()
             if b != node
-            ]
-        return CausalGraphicalModel(nodes, edges, set_nodes)
+            and a in self.observed_variables
+            and b in self.observed_variables
+        ]
+        latent_edges = [
+            (a, b)
+            for a, b in self.latent_edges
+            if a not in set_nodes
+            and b not in set_nodes
+        ]
+        return CausalGraphicalModel(
+            nodes=nodes, edges=edges,
+            latent_edges=latent_edges, set_nodes=set_nodes)
 
-    def _check_d_separation(self, path, zs):
+    def _check_d_separation(self, path, zs=None):
         """
         Check if a path is d-separated by set of variables zs.
         """
+        zs = _variable_or_iterable_to_set(zs)
+
         if len(path) < 3:
             return False
 
@@ -134,13 +175,14 @@ class CausalGraphicalModel:
 
         raise ValueError("Unsure how to classify ({},{},{})".format(a, b, c))
 
-    def is_d_separated(self, x, y, zs=frozenset()):
+    def is_d_separated(self, x, y, zs=None):
         """
         Is x d-separated from y, conditioned on zs?
         """
-        assert x in self.dag.nodes()
-        assert y in self.dag.nodes()
-        assert all([z in self.dag.nodes() for z in zs])
+        zs = _variable_or_iterable_to_set(zs)
+        assert x in self.observed_variables
+        assert y in self.observed_variables
+        assert all([z in self.observed_variables for z in zs])
 
         paths = nx.all_simple_paths(self.graph, x, y)
         return all(self._check_d_separation(path, zs) for path in paths)
@@ -151,8 +193,8 @@ class CausalGraphicalModel:
         implied by the graph structure.
         """
         conditional_independences = []
-        for x, y in combinations(self.dag.nodes(), 2):
-            remaining_variables = set(self.dag.nodes()) - {x, y}
+        for x, y in combinations(self.observed_variables, 2):
+            remaining_variables = set(self.observed_variables) - {x, y}
             for cardinality in range(len(remaining_variables) + 1):
                 for z in combinations(remaining_variables, cardinality):
                     if self.is_d_separated(x, y, frozenset(z)):
@@ -169,15 +211,100 @@ class CausalGraphicalModel:
             for path in nx.all_simple_paths(self.graph, x, y)
             if len(path) > 2
             and path[1] in self.dag.predecessors(x)
-            ]
+        ]
 
-    def is_valid_adjustment_set(self, x, y, z):
+    def is_valid_backdoor_adjustment_set(self, x, y, z):
         """
-        Test whether z is a valid adjustment set for
-        estimating the causal impact of x on y via the
+        Test whether z is a valid backdoor adjustment set for
+        estimating the causal impact of x on y via the backdoor
         adjustment formula:
 
         P(y|do(x)) = \sum_{z}P(y|x,z)P(z)
+
+        Arguments
+        ---------
+        x: str
+            Intervention Variable
+
+        y: str
+            Target Variable
+
+        z: str or set[str]
+            Adjustment variables
+
+        Returns
+        -------
+        is_valid_adjustment_set: bool
+        """
+        z = _variable_or_iterable_to_set(z)
+
+        assert x in self.observed_variables
+        assert y in self.observed_variables
+        assert x not in z
+        assert y not in z
+
+        if any([zz in nx.descendants(self.dag, x) for zz in z]):
+            return False
+
+        unblocked_backdoor_paths = [
+            path
+            for path in self.get_all_backdoor_paths(x, y)
+            if not self._check_d_separation(path, z)
+        ]
+
+        if unblocked_backdoor_paths:
+            return False
+
+        return True
+
+    def get_all_backdoor_adjustment_sets(self, x, y):
+        """
+        Get all sets of variables which are valid adjustment sets for
+        estimating the causal impact of x on y via the back door 
+        adjustment formula:
+
+        P(y|do(x)) = \sum_{z}P(y|x,z)P(z)
+
+        Note that the empty set can be a valid adjustment set for some CGMs,
+        in this case frozenset(frozenset(), ...) is returned. This is different
+        from the case where there are no valid adjustment sets where the
+        empty set is returned.
+
+        Arguments
+        ---------
+        x: str 
+            Intervention Variable 
+        y: str
+            Target Variable
+
+        Returns
+        -------
+        condition set: frozenset[frozenset[variables]]
+        """
+        assert x in self.observed_variables
+        assert y in self.observed_variables
+
+        possible_adjustment_variables = (
+            set(self.observed_variables)
+            - {x} - {y}
+            - set(nx.descendants(self.dag, x))
+        )
+
+        valid_adjustment_sets = frozenset([
+            frozenset(s)
+            for s in _powerset(possible_adjustment_variables)
+            if self.is_valid_backdoor_adjustment_set(x, y, s)
+        ])
+
+        return valid_adjustment_sets
+
+    def is_valid_frontdoor_adjustment_set(self, x, y, z):
+        """
+        Test whether z is a valid frontdoor adjustment set for
+        estimating the causal impact of x on y via the frontdoor
+        adjustment formula:
+
+        P(y|do(x)) = \sum_{z}P(z|x)\sum_{x'}P(y|x',z)P(x')
 
         Arguments
         ---------
@@ -194,67 +321,104 @@ class CausalGraphicalModel:
         -------
         is_valid_adjustment_set: bool
         """
-        assert x in self.dag.nodes()
-        assert y in self.dag.nodes()
-        assert x not in z
-        assert y not in z
+        z = _variable_or_iterable_to_set(z)
 
-        if any([zz in nx.descendants(self.dag, x) for zz in z]):
+        # 1. does z block all directed paths from x to y?
+        unblocked_directed_paths = [
+            path for path in
+            nx.all_simple_paths(self.dag, x, y)
+            if not any(zz in path for zz in z)
+        ]
+
+        if unblocked_directed_paths:
             return False
 
-        unblocked_backdoor_paths = [
+        # 2. no unblocked backdoor paths between x and z
+        unblocked_backdoor_paths_x_z = [
             path
-            for path in self.get_all_backdoor_paths(x, y)
-            if not self._check_d_separation(path, z)
-            ]
+            for zz in z
+            for path in self.get_all_backdoor_paths(x, zz)
+            if not self._check_d_separation(path, z - {zz})
+        ]
 
-        if unblocked_backdoor_paths:
+        if unblocked_backdoor_paths_x_z:
+            return False
+
+        # 3. x is a valid backdoor adjustment set for z
+        if not all(self.is_valid_backdoor_adjustment_set(zz, y, x) for zz in z):
             return False
 
         return True
 
-    def get_all_backdoor_adjustment_sets(self, x, y):
+    def get_all_frontdoor_adjustment_sets(self, x, y):
         """
-        Get all sets of variables which are valid adjustment sets for
-        estimating the causal impact of x on y via the back door 
-        adjustment formula:
+        Get all sets of variables which are valid frontdoor adjustment sets for
+        estimating the causal impact of x on y via the frontdoor adjustment
+        formula:
 
-        P(y|do(x)) = \sum_{z}P(y|x,z)P(z)
+        P(y|do(x)) = \sum_{z}P(z|x)\sum_{x'}P(y|x',z)P(x')
 
-        If there is no such set, returns None.
+        Note that the empty set can be a valid adjustment set for some CGMs,
+        in this case frozenset(frozenset(), ...) is returned. This is different
+        from the case where there are no valid adjustment sets where the
+        empty set is returned.
 
         Arguments
         ---------
-        x: str 
-            Intervention Variable 
+        x: str
+            Intervention Variable
         y: str
             Target Variable
 
         Returns
         -------
-        condition set: frozenset or None
-            Set of variable to condition on or None if no such
-            set exists.
+        condition set: frozenset[frozenset[variables]]
         """
-        assert x in self.dag.nodes()
-        assert y in self.dag.nodes()
+        assert x in self.observed_variables
+        assert y in self.observed_variables
 
         possible_adjustment_variables = (
-            set(self.dag.nodes())
+            set(self.observed_variables)
             - {x} - {y}
-            - set(nx.descendants(self.dag, x))
         )
 
-        valid_adjustment_sets = frozenset([
-                                              frozenset(s)
-                                              for s in _powerset(
-                possible_adjustment_variables)
-                                              if
-                                              self.is_valid_adjustment_set(x, y,
-                                                                           s)
-                                              ])
+        valid_adjustment_sets = frozenset(
+            [
+                frozenset(s)
+                for s in _powerset(possible_adjustment_variables)
+                if self.is_valid_frontdoor_adjustment_set(x, y, s)
+            ])
 
         return valid_adjustment_sets
+
+
+def _variable_or_iterable_to_set(x):
+    """
+    Convert variable or iterable x to a frozenset.
+
+    If x is None, returns the empty set.
+
+    Arguments
+    ---------
+    x: None, str or Iterable[str]
+
+    Returns
+    -------
+    x: frozenset[str]
+
+    """
+    if x is None:
+        return frozenset([])
+
+    if isinstance(x, str):
+        return frozenset([x])
+
+    if not isinstance(x, Iterable) or not all(isinstance(xx, str) for xx in x):
+        raise ValueError(
+            "{} is expected to be either a string or an iterable of strings"
+            .format(x))
+
+    return frozenset(x)
 
 
 def _powerset(iterable):

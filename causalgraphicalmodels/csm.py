@@ -43,7 +43,8 @@ class StructuralCausalModel:
                                  "Instead got {} for node {}."
                                  .format(model, node))
 
-        self.cgm = CausalGraphicalModel(nodes, edges, set_nodes)
+        self.cgm = CausalGraphicalModel(
+            nodes=nodes, edges=edges, set_nodes=set_nodes)
 
     def __repr__(self):
         variables = ", ".join(map(str, sorted(self.cgm.dag.nodes())))
@@ -77,7 +78,7 @@ class StructuralCausalModel:
 
             if c_model is None:
                 assert len(set_values[node]) == n_samples
-                samples[node] = set_values[node]
+                samples[node] = np.array(set_values[node])
             else:
                 parent_samples = {
                     parent: samples[parent]
@@ -184,6 +185,59 @@ def logistic_model(parents, weights, offset=0):
         a = _sigma(a)
         a = np.random.binomial(n=1, p=a)
         return a
-        
 
     return CausalAssignmentModel(model, parents)
+
+
+def discrete_model(parents, lookup_table):
+    """
+    Create CausalAssignmentModel based on a lookup table.
+
+    Lookup_table maps inputs values to weigths of the output values
+    The actual output values are sampled from a discrete distribution
+    of integers with probability proportional to the weights.
+
+    Lookup_table for the form:
+
+    Dict[Tuple(input_vales): (output_weights)]
+
+    Arguments
+    ---------
+    parents: list
+        variable names of parents
+
+    lookup_table: dict
+        lookup table
+
+    Returns
+    -------
+        model: CausalAssignmentModel
+    """
+    assert len(parents) > 0
+
+    # create input/output mapping
+    inputs, weights = zip(*lookup_table.items())
+
+    output_length = len(weights[0])
+    assert all(len(w) == output_length for w in weights)
+    outputs = np.arange(output_length)
+
+    ps = [np.array(w) / sum(w) for w in weights]
+
+    def model(**kwargs):
+        n_samples = kwargs["n_samples"]
+        a = np.vstack([kwargs[p] for p in parents]).T
+
+        b = np.zeros(n_samples) * np.nan
+        for m, p in zip(inputs, ps):
+            b = np.where(
+                (a == m).all(axis=1),
+                np.random.choice(outputs, size=n_samples, p=p), b)
+
+        if np.isnan(b).any():
+            raise ValueError("It looks like an input was provided which doesn't have a lookup.")
+
+        return b
+
+    return CausalAssignmentModel(model, parents)
+
