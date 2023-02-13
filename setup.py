@@ -27,7 +27,7 @@ setup(
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering",
         "License :: OSI Approved :: MIT License",
-        "Programming Language :: Python :: 3.5",
+        "Programming Language :: Python :: 3.5 3.6 3.7 3.8 3.9 3.10",
     ],
     keywords="causal inference causal graphical models causality",
     packages=find_packages(exclude=["notebook", "test"]),

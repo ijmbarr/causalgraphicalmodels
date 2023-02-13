@@ -1,7 +1,12 @@
 import networkx as nx
 import graphviz
 from itertools import combinations, chain
-from collections import Iterable
+import sys
+
+if sys.version_info.major == 3 and sys.version_info.minor >= 9:
+    from collections.abc import Iterable
+else:
+    from collections import Iterable
 
 
 class CausalGraphicalModel:
